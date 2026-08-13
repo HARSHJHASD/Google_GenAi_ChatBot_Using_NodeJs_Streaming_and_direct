@@ -20,7 +20,7 @@ const MAX_OUTPUT_TOKENS = 4000;
 // GEMINI CONFIG
 // ============================================================
 // NOTE: "gemini-3.6-flash" is not a real model name in the current
-// Gemini lineup, so this uses "gemini-2.5-flash", a real, current
+// Gemini lineup, so this uses "gemini-3.6-flash", a real, current
 // model. Swap it for whatever model your API key has access to.
 
 const AI_CONFIG = {
@@ -162,13 +162,17 @@ async function generateGeminiResponse(prompt) {
 }
 
 // ============================================================
-// SSE HELPERS
+// PLAIN-TEXT STREAM HELPERS
 // ============================================================
+// Simpler alternative to SSE: just keep the HTTP response open and
+// res.write() raw text chunks as they arrive from Gemini. The
+// client reads the response body as a stream (no "data: ..." event
+// framing, no JSON envelopes per chunk).
 
-function setupSSE(res) {
+function setupPlainStream(res) {
   res.status(200);
 
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
@@ -180,14 +184,6 @@ function setupSSE(res) {
   if (typeof res.socket?.setKeepAlive === "function") {
     res.socket.setKeepAlive(true);
   }
-}
-
-function sendSSE(res, data) {
-  if (res.writableEnded) {
-    return;
-  }
-
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
 // ============================================================
@@ -275,14 +271,12 @@ app.post("/api/ask/stream", async (req, res) => {
   }
 
   // ==========================================================
-  // ESTABLISH SSE IMMEDIATELY
+  // ESTABLISH PLAIN-TEXT STREAM IMMEDIATELY
   // ==========================================================
 
-  setupSSE(res);
+  setupPlainStream(res);
 
-  sendSSE(res, { type: "start" });
-
-  console.log("📡 SSE connection established");
+  console.log("📡 Plain-text stream connection established");
 
   let clientDisconnected = false;
 
@@ -304,13 +298,9 @@ app.post("/api/ask/stream", async (req, res) => {
     const inputTokens = tokenResult?.totalTokens ?? 0;
 
     if (inputTokens > MAX_INPUT_TOKENS) {
-      sendSSE(res, {
-        type: "error",
-        error:
-          `Prompt is too large. ` +
-          `Maximum allowed input is ` +
-          `${MAX_INPUT_TOKENS} tokens.`,
-      });
+      res.write(
+        `\n[error] Prompt is too large. Maximum allowed input is ${MAX_INPUT_TOKENS} tokens.\n`
+      );
 
       return res.end();
     }
@@ -334,10 +324,8 @@ app.post("/api/ask/stream", async (req, res) => {
 
     console.log("✅ Gemini stream created");
 
-    let finalUsage = {};
-
     // ========================================================
-    // READ GEMINI STREAM
+    // READ GEMINI STREAM — write each text chunk straight through
     // ========================================================
 
     for await (const chunk of stream) {
@@ -345,48 +333,23 @@ app.post("/api/ask/stream", async (req, res) => {
         break;
       }
 
-      const text = chunk?.text || "";
+      const text = chunk?.text;
 
       if (text) {
-        sendSSE(res, {
-          type: "text",
-          text,
-        });
-      }
-
-      // The usage metadata typically arrives fully populated on
-      // the last chunk; keep overwriting so we end with the latest.
-      if (chunk?.usageMetadata) {
-        finalUsage = getUsage(chunk.usageMetadata);
+        res.write(text);
       }
     }
-
-    if (!clientDisconnected) {
-      sendSSE(res, {
-        type: "done",
-        usage: finalUsage,
-        estimated_input_tokens: inputTokens,
-      });
-    }
-
-    // ========================================================
-    // CLOSE SSE
-    // ========================================================
 
     if (!res.writableEnded) {
       res.end();
     }
 
-    console.log("🔌 SSE connection closed");
+    console.log("🔌 Stream connection closed");
   } catch (error) {
     console.error("❌ STREAM ERROR:", error);
 
     if (!res.writableEnded) {
-      sendSSE(res, {
-        type: "error",
-        error: getErrorMessage(error),
-      });
-
+      res.write(`\n[error] ${getErrorMessage(error)}\n`);
       res.end();
     }
   }
@@ -601,7 +564,6 @@ app.get("/", (req, res) => {
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        let buffer = "";
 
         while (true) {
           const { value, done } = await reader.read();
@@ -610,72 +572,16 @@ app.get("/", (req, res) => {
             break;
           }
 
-          buffer += decoder.decode(value, { stream: true });
+          const text = decoder.decode(value, { stream: true });
 
-          const events = buffer.split(/\\r?\\n\\r?\\n/);
-          buffer = events.pop() || "";
-
-          for (const event of events) {
-            processSSEEvent(event);
-          }
-        }
-
-        buffer += decoder.decode();
-
-        if (buffer.trim()) {
-          processSSEEvent(buffer);
+          streamResult.textContent += text;
+          streamResult.scrollTop = streamResult.scrollHeight;
         }
       } catch (error) {
         streamResult.innerHTML +=
           '<span class="error">' + "\\n\\nError: " + escapeHtml(error.message) + "</span>";
       } finally {
         setLoading(false);
-      }
-    }
-
-    function processSSEEvent(event) {
-      const lines = event.split(/\\r?\\n/);
-
-      const dataLines = lines
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trim());
-
-      if (dataLines.length === 0) {
-        return;
-      }
-
-      const json = dataLines.join("\\n");
-
-      if (!json || json === "[DONE]") {
-        return;
-      }
-
-      let data;
-
-      try {
-        data = JSON.parse(json);
-      } catch (error) {
-        console.error("Invalid SSE JSON:", json, error);
-        return;
-      }
-
-      if (data.type === "start") {
-        return;
-      }
-
-      if (data.type === "text") {
-        streamResult.textContent += data.text || "";
-        streamResult.scrollTop = streamResult.scrollHeight;
-        return;
-      }
-
-      if (data.type === "error") {
-        throw new Error(data.error || "Streaming failed.");
-      }
-
-      if (data.type === "done") {
-        showUsage("Streaming Response Usage", data.usage || {}, data.estimated_input_tokens);
-        return;
       }
     }
 
